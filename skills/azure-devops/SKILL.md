@@ -180,28 +180,93 @@ az boards work-item relation add \
 
 ## Pull Requests
 
+### CRITICAL: Before Creating a PR
+
+**DO NOT** use `az devops configure` or `az devops project list` to discover project info.
+**ALWAYS** extract organization, project, and repository from the git remote URL first.
+
+The git remote URL contains ALL required information:
+```
+https://dev.azure.com/ORG/PROJECT/_git/REPO
+```
+
+### Creating a Pull Request (Step-by-Step)
+
+Follow these steps IN ORDER to avoid failures:
+
+**Step 1: Extract org/project/repo from git remote (DO THIS FIRST)**
+
 ```bash
-# Create PR
+# Get the remote URL - parse ORG, PROJECT, REPO from it
+git remote get-url origin
+# Example output: https://dev.azure.com/myorg/My%20Project/_git/My.Repo
+# ORG = myorg
+# PROJECT = My Project (URL decode %20 to space)
+# REPO = My.Repo
+```
+
+**Step 2: Check if source branch is pushed to remote**
+
+```bash
+# Verify branch exists on remote
+git ls-remote --heads origin | grep <branch-name>
+
+# If NOT found, push first:
+git push -u origin <branch-name>
+```
+
+**Step 3: Prepare description (MUST be under 4000 characters)**
+
+```bash
+# Check description length - Azure DevOps limit is 4000 characters
+wc -c description.md
+# If over 4000, shorten the description before proceeding
+```
+
+**Step 4: Create PR with ALL required flags**
+
+```bash
 az repos pr create \
   --source-branch feature/my-branch \
-  --target-branch main \
+  --target-branch develop \
   --title "PR Title" \
-  --description "PR Description"
+  --description "$(cat description.md)" \
+  --organization https://dev.azure.com/ORG \
+  --project "PROJECT" \
+  --repository "REPO"
+```
 
+**Required flags for `az repos pr create`:**
+- `--source-branch` - Your feature branch
+- `--target-branch` - Target branch (e.g., develop, main)
+- `--title` - PR title
+- `--organization` - Full URL: `https://dev.azure.com/ORG`
+- `--project` - Project name (with spaces, not URL encoded)
+- `--repository` - Repository name (REQUIRED - not optional despite docs)
+
+### PR Management
+
+```bash
 # List PRs
-az repos pr list --status active
+az repos pr list --status active \
+  --organization https://dev.azure.com/ORG \
+  --project "PROJECT"
 
 # Show PR details
-az repos pr show --id 123
+az repos pr show --id 123 \
+  --organization https://dev.azure.com/ORG
 
 # Add reviewer
-az repos pr reviewer add --id 123 --reviewers user@domain.com
+az repos pr reviewer add --id 123 --reviewers user@domain.com \
+  --organization https://dev.azure.com/ORG
 
 # Vote on PR
-az repos pr set-vote --id 123 --vote approve
+az repos pr set-vote --id 123 --vote approve \
+  --organization https://dev.azure.com/ORG
 
 # Complete PR
-az repos pr update --id 123 --status completed
+az repos pr update --id 123 --status completed \
+  --organization https://dev.azure.com/ORG
 ```
 
 ## Pipelines
@@ -288,12 +353,22 @@ done
 ### Create PR with Work Items
 
 ```bash
-# Create PR and link work items
+# First: Extract org/project/repo from git remote
+# git remote get-url origin → https://dev.azure.com/ORG/PROJECT/_git/REPO
+
+# Second: Verify branch is pushed
+# git ls-remote --heads origin | grep feature/my-branch
+
+# Create PR and link work items (all flags required)
 PR_ID=$(az repos pr create \
   --source-branch feature/my-branch \
   --target-branch main \
   --title "My PR" \
+  --description "PR description (max 4000 chars)" \
   --work-items 12345 67890 \
+  --organization https://dev.azure.com/ORG \
+  --project "PROJECT" \
+  --repository "REPO" \
   --query "pullRequestId" -o tsv)
 
 echo "Created PR: $PR_ID"
@@ -318,6 +393,7 @@ done
 
 ## Best Practices
 
+### General
 1. **Always pass `--organization` and `--project`** explicitly - NEVER use `az devops configure` to set defaults
 2. **Use environment variables** for PAT (`AZURE_DEVOPS_EXT_PAT`)
 3. **Filter output** with `--query` to extract specific fields
@@ -325,7 +401,13 @@ done
 5. **Check existence** before creation to ensure idempotency
 6. **Use latest API version** (7.1) for REST API calls
 7. **Implement retry logic** for transient failures (rate limits, timeouts)
-8. **Find correct project** by querying existing related work items first
+
+### Pull Requests
+8. **Parse git remote first** - Extract org/project/repo from `git remote get-url origin` before any az commands
+9. **NEVER use `az devops project list` for discovery** - All info is in the git remote URL
+10. **Always include `--repository`** - This flag is required despite documentation suggesting otherwise
+11. **PR description limit is 4000 characters** - Check length before creating PR
+12. **Verify branch is pushed** - Source branch must exist on remote before PR creation
 
 ## Troubleshooting
 
