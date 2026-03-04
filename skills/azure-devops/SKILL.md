@@ -31,6 +31,10 @@ Work with Azure DevOps using `az` CLI commands and REST API for operations not s
 
 ## Work Items
 
+> **IMPORTANT**: `az boards work-item show` and `az boards work-item update` do NOT accept `--project`.
+> Work item IDs are unique within an organization — only `--org` is required.
+> The `--project` flag is only supported by `create` and `query` commands.
+
 ### Create
 
 ```bash
@@ -156,14 +160,16 @@ az boards work-item update \
 ### Query
 
 ```bash
-# List work items
-az boards work-item show --id 12345
+# Show a work item (only --org needed, --project is NOT supported)
+az boards work-item show --id 12345 --org https://dev.azure.com/myorg
 
-# Query with WIQL
-az boards query --wiql "SELECT [System.Id], [System.Title] FROM WorkItems WHERE [System.State] = 'Active'"
+# Query with WIQL (--project IS supported here)
+az boards query --wiql "SELECT [System.Id], [System.Title] FROM WorkItems WHERE [System.State] = 'Active'" \
+  --org https://dev.azure.com/myorg --project "MyProject"
 
-# Filter output
-az boards work-item show --id 12345 --query "fields.['System.Title', 'System.State']"
+# Filter specific fields
+az boards work-item show --id 12345 --org https://dev.azure.com/myorg \
+  --query "fields.['System.Title', 'System.State']" -o tsv
 ```
 
 ### Relations
@@ -338,6 +344,22 @@ az boards work-item show --id 12345 --query "fields.['System.Title']" -o tsv
 
 ## Common Patterns
 
+### Fetch Work Items from URLs
+
+```bash
+# Parse work item URL → extract org and ID
+# URL format: https://dev.azure.com/ORG/PROJECT/_workitems/edit/ID
+# Only org and ID are needed for show/update (--project is NOT a valid flag)
+
+# Fetch a single work item from URL
+az boards work-item show --id 20210 --org https://dev.azure.com/huskyims-it -o json
+
+# Batch fetch multiple work items
+for ID in 20210 20214 20215; do
+  az boards work-item show --id $ID --org https://dev.azure.com/huskyims-it -o json
+done
+```
+
 ### Bulk Update Work Items
 
 ```bash
@@ -394,7 +416,7 @@ done
 ## Best Practices
 
 ### General
-1. **Always pass `--organization` and `--project`** explicitly - NEVER use `az devops configure` to set defaults
+1. **Always pass `--organization`** explicitly. Pass `--project` only for commands that support it (`create`, `query`) — `show` and `update` do NOT accept `--project` (work item IDs are unique per org)
 2. **Use environment variables** for PAT (`AZURE_DEVOPS_EXT_PAT`)
 3. **Filter output** with `--query` to extract specific fields
 4. **Use TSV output** (`-o tsv`) for scripting to avoid parsing JSON
