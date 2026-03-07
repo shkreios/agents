@@ -1,6 +1,6 @@
 ---
 name: azure-devops
-description: Work with Azure DevOps using az CLI commands and REST API. Use for: (1) Managing work items (create, update, query), (2) Pull request operations, (3) Pipeline management, (4) Repository operations, (5) Project and organization tasks. Includes support for markdown-formatted work item fields not available in standard az CLI.
+description: "Work with Azure DevOps using az CLI commands and REST API. Use for: (1) Managing work items (create, update, query), (2) Pull request operations, (3) Pipeline management, (4) Repository operations, (5) Project and organization tasks. Includes support for markdown-formatted work item fields not available in standard az CLI."
 ---
 
 ## Requirements
