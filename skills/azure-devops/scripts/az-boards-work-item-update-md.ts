@@ -1,351 +1,251 @@
 #!/usr/bin/env bun
 
 import { cac } from "cac";
-import { execFileSync, execSync } from "child_process";
+import { execFileSync } from "child_process";
+import { existsSync, readFileSync } from "fs";
 
 const cli = cac("az-boards-work-item-update-md");
 
-// Helper to read content from file or use as string
-const getContent = (input: string): string => {
-  if (!input) return "";
-
-  // Check if it's a file path
-  try {
-    const fs = require("fs");
-    if (fs.existsSync(input)) {
-      return fs.readFileSync(input, "utf-8");
-    }
-  } catch (e) {
-    // Not a file, treat as string
-  }
-  return input;
+const fail = (message: string): never => {
+  console.error(`Error: ${message}`);
+  process.exit(1);
 };
 
-// Helper to get organization URL
-const getOrgUrl = (options: {
+const az = (args: string[]): string =>
+  execFileSync("az", args, { encoding: "utf-8" });
+
+// Input is either a path to a markdown file or an inline markdown string
+const readContent = (input?: string): string | undefined => {
+  if (!input) return undefined;
+  return existsSync(input) ? readFileSync(input, "utf-8") : input;
+};
+
+const resolveOrgUrl = (options: {
   org?: string;
   organization?: string;
-  detect?: string;
 }): string => {
   let orgUrl = options.org || options.organization;
-  if (!orgUrl && options.detect === "true") {
+  if (!orgUrl) {
     try {
-      const configOutput = execSync("az devops configure --list 2>/dev/null", {
-        encoding: "utf-8",
-      });
-      const orgMatch = configOutput.match(/organization\s*=\s*(\S+)/);
-      if (orgMatch) {
-        orgUrl = orgMatch[1];
-      }
-    } catch (e) {
-      // Ignore detection errors, will fail later if org is required
+      const config = az(["devops", "configure", "--list"]);
+      orgUrl = config.match(/organization\s*=\s*(\S+)/)?.[1];
+    } catch {
+      // fall through to the error below
     }
   }
-
   if (!orgUrl) {
-    console.error(
-      "Error: Organization URL is required. Set with --organization parameter."
+    fail(
+      "Organization URL is required and none is set in `az devops configure`. Pass --organization https://dev.azure.com/myorg"
     );
-    console.error("Example: --organization https://dev.azure.com/myorg");
-    process.exit(1);
   }
-
-  return orgUrl;
+  return orgUrl!.replace(/\/+$/, "");
 };
 
-// Helper to update work item with markdown fields via REST API
+const getAccessToken = (): string => {
+  try {
+    return az([
+      "account",
+      "get-access-token",
+      "--resource",
+      "499b84ac-1321-427f-aa17-267ca6975798", // Azure DevOps resource ID
+      "--query",
+      "accessToken",
+      "-o",
+      "tsv",
+    ]).trim();
+  } catch {
+    return fail("Could not acquire an Azure access token. Run `az login` first.");
+  }
+};
+
+// "RefName=file-or-inline-md" → { ref, input }; repeatable flags arrive as arrays
+const parseFieldArgs = (field?: string | string[]): Array<{ ref: string; input: string }> =>
+  (field === undefined ? [] : ([] as string[]).concat(field)).map((entry) => {
+    const sep = entry.indexOf("=");
+    if (sep <= 0) {
+      fail(`--field must be <RefName>=<file-or-inline-markdown>, got: ${entry}`);
+    }
+    return { ref: entry.slice(0, sep).trim(), input: entry.slice(sep + 1) };
+  });
+
+// Set multiline fields with Markdown format via REST API
+// (the az CLI cannot set multilineFieldsFormat)
 const updateMarkdownFields = async (
   workItemId: string,
   orgUrl: string,
   description?: string,
   acceptanceCriteria?: string,
-  apiVersion: string = "7.1"
-): Promise<any> => {
-  // Build JSON patch operations
-  const patchOps: Array<{
-    op: string;
-    path: string;
-    value: string;
-  }> = [];
+  extraFields: Array<{ ref: string; input: string }> = []
+): Promise<string[]> => {
+  const patchOps: Array<{ op: string; path: string; value: string }> = [];
+  const updatedFields: string[] = [];
 
-  // Add description if provided
-  if (description) {
-    const descContent = getContent(description);
+  const addField = (field: string, label: string, input?: string) => {
+    const value = readContent(input);
+    if (!value) return;
     patchOps.push(
-      {
-        op: "add",
-        path: "/fields/System.Description",
-        value: descContent,
-      },
-      {
-        op: "add",
-        path: "/multilineFieldsFormat/System.Description",
-        value: "Markdown",
-      }
+      { op: "add", path: `/fields/${field}`, value },
+      { op: "add", path: `/multilineFieldsFormat/${field}`, value: "Markdown" }
     );
+    updatedFields.push(label);
+  };
+
+  addField("System.Description", "Description", description);
+  addField(
+    "Microsoft.VSTS.Common.AcceptanceCriteria",
+    "Acceptance Criteria",
+    acceptanceCriteria
+  );
+  for (const { ref, input } of extraFields) {
+    addField(ref, ref, input);
   }
 
-  // Add acceptance criteria if provided
-  if (acceptanceCriteria) {
-    const criteriaContent = getContent(acceptanceCriteria);
-    patchOps.push(
-      {
-        op: "add",
-        path: "/fields/Microsoft.VSTS.Common.AcceptanceCriteria",
-        value: criteriaContent,
+  if (patchOps.length === 0) return updatedFields;
+
+  const response = await fetch(
+    `${orgUrl}/_apis/wit/workitems/${workItemId}?api-version=7.1`,
+    {
+      method: "PATCH",
+      headers: {
+        "Content-Type": "application/json-patch+json",
+        Authorization: `Bearer ${getAccessToken()}`,
       },
-      {
-        op: "add",
-        path: "/multilineFieldsFormat/Microsoft.VSTS.Common.AcceptanceCriteria",
-        value: "Markdown",
-      }
-    );
-  }
-
-  if (patchOps.length === 0) {
-    return null; // No markdown fields to update
-  }
-
-  // Get access token for Azure DevOps
-  const token = execSync(
-    "az account get-access-token --resource 499b84ac-1321-427f-aa17-267ca6975798 --query accessToken -o tsv",
-    { encoding: "utf-8" }
-  ).trim();
-
-  // Build API URL
-  let apiUrl: string;
-  if (orgUrl.includes("/_apis/")) {
-    apiUrl = `${orgUrl}/wit/workitems/${workItemId}?api-version=${apiVersion}`;
-  } else {
-    apiUrl = `${orgUrl}/_apis/wit/workitems/${workItemId}?api-version=${apiVersion}`;
-  }
-
-  // Make the PATCH request
-  const response = await fetch(apiUrl, {
-    method: "PATCH",
-    headers: {
-      "Content-Type": "application/json-patch+json",
-      Authorization: `Bearer ${token}`,
-    },
-    body: JSON.stringify(patchOps),
-  });
+      body: JSON.stringify(patchOps),
+    }
+  );
 
   if (!response.ok) {
-    const errorText = await response.text();
-    console.error(
-      `Error: Failed to update work item ${workItemId} with markdown fields`
+    fail(
+      `Failed to update work item ${workItemId} (${response.status} ${response.statusText}): ${await response.text()}`
     );
-    console.error(`Status: ${response.status} ${response.statusText}`);
-    console.error(`Details: ${errorText}`);
-    process.exit(1);
   }
 
-  return await response.json();
+  return updatedFields;
 };
 
-// CREATE command
 cli
   .command("create", "Create work item with markdown-formatted fields")
   .option("--title <title>", "Work item title (required)")
   .option(
     "--type <type>",
-    'Work item type (required, e.g., "User Story", "Task", "Bug")'
+    'Work item type (required, e.g. "User Story", "Task", "Bug")'
   )
-  .option("--org, --organization <org>", "Azure DevOps organization URL")
   .option("--project <project>", "Azure DevOps project name (required)")
   .option(
-    "--description <description>",
-    "Path to markdown file for description or markdown string"
+    "--org, --organization <org>",
+    "Organization URL (default: from `az devops configure`)"
   )
-  .option("-d, --description <description>", "Alias for --description")
+  .option(
+    "-d, --description <description>",
+    "Markdown file path or inline markdown string"
+  )
   .option(
     "--acceptance-criteria <criteria>",
-    "Path to markdown file for acceptance criteria or markdown string"
+    "Markdown file path or inline markdown string"
   )
   .option(
-    "--assigned-to <email>",
-    "Email of the person to assign the work item to"
+    "--field <field>",
+    "Any multiline field as markdown: <RefName>=<file-or-inline-md> (repeatable, e.g. Microsoft.VSTS.TCM.ReproSteps=./repro.md)"
   )
+  .option("--assigned-to <email>", "Assignee email")
   .option("--area <area>", "Area path")
   .option("--iteration <iteration>", "Iteration path")
-  .option("--detect <detect>", "Automatically detect organization", {
-    default: "true",
-  })
-  .option("--api-version <version>", "API version to use", { default: "7.1" })
-  .option("--quiet", "Suppress detailed JSON output, only show ID and URL", {
-    default: false,
-  })
   .action(async (options) => {
-    try {
-      // Validate required fields
-      if (!options.title) {
-        console.error("Error: --title is required");
-        process.exit(1);
-      }
-      if (!options.type) {
-        console.error("Error: --type is required");
-        process.exit(1);
-      }
-      if (!options.project) {
-        console.error("Error: --project is required");
-        process.exit(1);
-      }
-
-      const orgUrl = getOrgUrl(options);
-
-      // Build az boards work-item create command
-      const createArgs = [
-        "boards",
-        "work-item",
-        "create",
-        "--title",
-        options.title,
-        "--type",
-        options.type,
-        "--organization",
-        orgUrl,
-        "--project",
-        options.project,
-        "--output",
-        "json",
-      ];
-
-      // Add optional fields (but NOT description - we'll add that via REST API)
-      if (options.assignedTo) {
-        createArgs.push("--assigned-to", options.assignedTo);
-      }
-      if (options.area) {
-        createArgs.push("--area", options.area);
-      }
-      if (options.iteration) {
-        createArgs.push("--iteration", options.iteration);
-      }
-
-      // Execute work item creation
-      console.log(`Creating work item: ${options.title}...`);
-
-      // Properly escape arguments by using JSON.stringify for shell safety
-      const createOutput = execFileSync("az", createArgs, {
-        encoding: "utf-8",
-      });
-
-      const createdWorkItem = JSON.parse(createOutput);
-      const workItemId = createdWorkItem.id.toString();
-
-      console.log(`✅ Created work item ${workItemId}`);
-
-      // Update with markdown fields if provided
-      const hasMarkdownFields =
-        options.description || options.d || options.acceptanceCriteria;
-      if (hasMarkdownFields) {
-        console.log(`Updating work item ${workItemId} with markdown fields...`);
-        const result = await updateMarkdownFields(
-          workItemId,
-          orgUrl,
-          options.description || options.d,
-          options.acceptanceCriteria,
-          options.apiVersion
-        );
-
-        if (result) {
-          const updatedFields: string[] = [];
-          if (options.description || options.d)
-            updatedFields.push("Description");
-          if (options.acceptanceCriteria)
-            updatedFields.push("Acceptance Criteria");
-          console.log(
-            `✅ Updated markdown fields: ${updatedFields.join(", ")}`
-          );
-        }
-      }
-
-      // Output the work item details
-      if (!options.quiet) {
-        console.log("\nWork Item Details:");
-        console.log(JSON.stringify(createdWorkItem, null, 2));
-      }
-
-      // Extract and show the work item URL
-      const workItemUrl =
-        createdWorkItem._links?.html?.href ||
-        `${orgUrl}/${options.project}/_workitems/edit/${workItemId}`;
-      console.log(`\n🔗 Work Item URL: ${workItemUrl}`);
-      console.log(`📋 Work Item ID: ${workItemId}`);
-    } catch (error) {
-      console.error("Error:", error instanceof Error ? error.message : error);
-      process.exit(1);
+    for (const flag of ["title", "type", "project"] as const) {
+      if (!options[flag]) fail(`--${flag} is required`);
     }
+
+    const orgUrl = resolveOrgUrl(options);
+
+    const createArgs = [
+      "boards",
+      "work-item",
+      "create",
+      "--title",
+      options.title,
+      "--type",
+      options.type,
+      "--organization",
+      orgUrl,
+      "--project",
+      options.project,
+      "--output",
+      "json",
+    ];
+    if (options.assignedTo) createArgs.push("--assigned-to", options.assignedTo);
+    if (options.area) createArgs.push("--area", options.area);
+    if (options.iteration) createArgs.push("--iteration", options.iteration);
+
+    let createdWorkItem: any;
+    try {
+      createdWorkItem = JSON.parse(az(createArgs));
+    } catch (error) {
+      fail(error instanceof Error ? error.message : String(error));
+    }
+    const workItemId = String(createdWorkItem.id);
+
+    const updatedFields = await updateMarkdownFields(
+      workItemId,
+      orgUrl,
+      options.description,
+      options.acceptanceCriteria,
+      parseFieldArgs(options.field)
+    );
+
+    const workItemUrl =
+      createdWorkItem._links?.html?.href ||
+      `${orgUrl}/${encodeURIComponent(options.project)}/_workitems/edit/${workItemId}`;
+    console.log(`Created work item ${workItemId}`);
+    if (updatedFields.length > 0) {
+      console.log(`Markdown fields set: ${updatedFields.join(", ")}`);
+    }
+    console.log(`URL: ${workItemUrl}`);
   });
 
-// UPDATE command (original functionality)
 cli
-  .command("update [id]", "Update work item with markdown-formatted fields")
-  .option("--id <id>", "The ID of the work item to update")
+  .command("update <id>", "Update work item with markdown-formatted fields")
   .option(
-    "--description <description>",
-    "Path to markdown file for description or markdown string"
+    "-d, --description <description>",
+    "Markdown file path or inline markdown string"
   )
-  .option("-d, --description <description>", "Alias for --description")
   .option(
     "--acceptance-criteria <criteria>",
-    "Path to markdown file for acceptance criteria or markdown string"
+    "Markdown file path or inline markdown string"
   )
-  .option("--org, --organization <org>", "Azure DevOps organization URL")
-  .option("--detect <detect>", "Automatically detect organization", {
-    default: "true",
-  })
-  .option("--api-version <version>", "API version to use", { default: "7.1" })
+  .option(
+    "--field <field>",
+    "Any multiline field as markdown: <RefName>=<file-or-inline-md> (repeatable, e.g. Microsoft.VSTS.TCM.ReproSteps=./repro.md)"
+  )
+  .option(
+    "--org, --organization <org>",
+    "Organization URL (default: from `az devops configure`)"
+  )
   .action(async (id, options) => {
-    try {
-      // Get work item ID from positional arg or --id flag
-      const workItemId = id || options.id;
-      if (!workItemId) {
-        console.error("Error: Work item ID is required");
-        cli.outputHelp();
-        process.exit(1);
-      }
-
-      if (!options.description && !options.d && !options.acceptanceCriteria) {
-        console.error(
-          "Error: At least one field (--description or --acceptance-criteria) must be provided"
-        );
-        process.exit(1);
-      }
-
-      const orgUrl = getOrgUrl(options);
-
-      // Update with markdown fields
-      const result = await updateMarkdownFields(
-        workItemId,
-        orgUrl,
-        options.description || options.d,
-        options.acceptanceCriteria,
-        options.apiVersion
+    if (!options.description && !options.acceptanceCriteria && !options.field) {
+      fail(
+        "At least one of --description, --acceptance-criteria or --field is required"
       );
-
-      if (!result) {
-        console.error("Error: No markdown fields to update");
-        process.exit(1);
-      }
-
-      // Output success message similar to az CLI
-      console.log(JSON.stringify(result, null, 2));
-      console.log(
-        `\n✅ Successfully updated work item ${workItemId} with markdown formatting`
-      );
-
-      // Show which fields were updated
-      const updatedFields: string[] = [];
-      if (options.description || options.d) updatedFields.push("Description");
-      if (options.acceptanceCriteria) updatedFields.push("Acceptance Criteria");
-      console.log(`Updated fields: ${updatedFields.join(", ")}`);
-    } catch (error) {
-      console.error("Error:", error instanceof Error ? error.message : error);
-      process.exit(1);
     }
+
+    const orgUrl = resolveOrgUrl(options);
+    const updatedFields = await updateMarkdownFields(
+      id,
+      orgUrl,
+      options.description,
+      options.acceptanceCriteria,
+      parseFieldArgs(options.field)
+    );
+
+    console.log(`Updated work item ${id}: ${updatedFields.join(", ")}`);
+    console.log(`URL: ${orgUrl}/_workitems/edit/${id}`);
   });
 
 cli.help();
-cli.version("1.1.0");
+cli.version("2.0.0");
 
-cli.parse();
+try {
+  cli.parse(process.argv, { run: false });
+  await cli.runMatchedCommand();
+} catch (error) {
+  fail(error instanceof Error ? error.message : String(error));
+}
